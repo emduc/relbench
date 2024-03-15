@@ -1,5 +1,6 @@
 import os
 
+import numpy as np
 import pandas as pd
 import pooch
 
@@ -158,3 +159,119 @@ class StackExDataset(RelBenchDataset):
         )
 
         return Database(tables)
+    
+    def shardDataset(self, num_shards: int = 2): 
+        r"""Shard the dataset horizontally to simulate distributed data.
+        
+        Datasets are stored in the cache."""
+        
+        db = self.make_db()
+        
+        shards = []
+        
+        users = db.table_dict["users"]
+        user_shards = np.array_split(users.df, num_shards)   
+        shards.append(
+                {"name": "users", 
+                 "df": user_shards, 
+                 "fk_to_table": users.fkey_col_to_pkey_table}
+                )
+        
+        votes = db.table_dict["votes"]  
+        vote_shards = []
+        remaining_votes = votes.df
+        
+        # TODO add asserts throughout the process, especially on sizes
+        remaining_posts = self.retrieve_foreign_rows(shards[0]["df"], vote_shards, remaining_votes, foreignKey="UserId")
+        # for user_shard in shards[0]["df"]:  
+        #     user_df_col = user_shard[["Id"]]
+        #     filtered_votes = remaining_votes.merge(user_df_col, left_on="UserId", right_on="Id", how="inner")
+            
+        #     filtered_votes.rename(columns={'Id_x': 'Id'}, inplace=True)
+        #     filtered_votes.drop(columns='Id_y', inplace=True)
+            
+            # remaining_votes = remaining_votes.merge(filtered_votes, on='Id', how="left", indicator=True)
+            # remaining_votes = remaining_votes[remaining_votes['_merge'] == 'left_only']
+            # remaining_votes.drop(columns={'_merge', 'UserId_y', 'PostId_y', 'VoteTypeId_y', 'CreationDate_y'}, inplace=True)
+            # remaining_votes.rename(columns={'UserId_x': 'UserId', 'PostId_x': 'PostId', 'VoteTypeId_x': 'VoteTypeId', 'CreationDate_x': 'CreationDate'}, inplace=True)
+
+            # remaining_votes = remaining_votes[~remaining_votes["Id"].isin(filtered_votes["Id"])]
+            # vote_shards.append(filtered_votes)
+        
+        # Filling the shards with the remaining votes 
+        vote_shards = self.fill_shards(num_shards, votes, vote_shards, remaining_votes)            
+        
+        shards.append(
+                {"name": "votes", 
+                 "df": vote_shards, 
+                 "fk_to_table": votes.fkey_col_to_pkey_table}
+                )   
+        
+        # Posts table
+        posts = db.table_dict["posts"]
+        post_shards = []
+        remaining_posts = posts.df
+            
+        remaining_posts = self.retrieve_foreign_rows(shards[0]["df"], post_shards, remaining_posts, foreignKey="OwnerUserId")
+        remaining_posts = self.retrieve_foreign_rows(shards[1]["df"], post_shards, remaining_posts, OnKey="PostId", foreignKey="Id")
+
+            
+        # for vote_shard in shards[1]["df"]:
+        #     vote_df_id = vote_shard[["PostId"]]
+        #     filtered_posts = remaining_posts.merge(vote_df_id, left_on="Id", right_on="PostId", how="inner")
+            
+        #     # filtered_posts.rename(columns={'Id_x': 'Id'}, inplace=True)
+        #     filtered_posts.drop(columns='PostId', inplace=True)
+        #     remaining_posts = remaining_posts[~remaining_posts["Id"].isin(filtered_posts["Id"])]
+            
+        #     post_shards.append(filtered_posts)
+            
+            
+        post_shards = self.fill_shards(num_shards, posts, post_shards, remaining_posts)            
+        
+        shards.append(
+        {"name": "posts", 
+            "df": post_shards, 
+            "fk_to_table": posts.fkey_col_to_pkey_table}
+        )   
+        
+        for shard in shards:
+            print("size of shard table " + shard["name"])
+            for i in range(num_shards):
+                print(shard["df"][i].shape[0])
+        
+        return db
+
+    def retrieve_foreign_rows(self, foreign_shards, current_shards, remaining_rows, OnKey="Id", foreignKey="Id"):
+        for foreign_shard in foreign_shards:
+            user_df_col = foreign_shard[[OnKey]]
+            filtered_rows = remaining_rows.merge(user_df_col, left_on=foreignKey, right_on=OnKey, how="inner")
+            
+            if OnKey == "Id":
+                filtered_rows.rename(columns={'Id_x': 'Id'}, inplace=True)
+                filtered_rows.drop(columns='Id_y', inplace=True)
+            else:
+                filtered_rows.drop(columns=OnKey, inplace=True)
+                
+            remaining_rows = remaining_rows[~remaining_rows["Id"].isin(filtered_rows["Id"])]
+            current_shards.append(filtered_rows)
+        return remaining_rows
+    
+
+
+    def fill_shards(self, num_shards, table, shards, remainings):
+        expected_batch_size = table.df.shape[0] / num_shards
+        result = []
+        for shard in shards:
+            empty_slots = expected_batch_size - shard.shape[0]
+            if empty_slots > 0:
+                additional_slots = remainings.sample(n=min(int(empty_slots), int(remainings.shape[0])))
+                shard = pd.concat([shard, additional_slots])
+                remainings = remainings.drop(additional_slots.index)
+            result.append(shard)
+        return result
+    
+# main function to debug the shardDataset function
+if __name__ == "__main__":
+    dataset = StackExDataset(process=True)
+    dataset.shardDataset(num_shards=2)
